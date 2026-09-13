@@ -97,15 +97,20 @@ def residual_update_fused(
     residual: Tensor, branch_output: Tensor, h_post: Tensor, h_res: Tensor, n: int
 ) -> Tensor:
     """Same contract as :func:`residual_update_fp32` through the merged fused mHC kernel
-    (``fused_h_post_bda`` with fp32 coefficients returns fp32; cast once to the residual
+    (``fused_h_post_bda`` with fp32 coefficients; the kernel stores the result in the residual
     dtype, as the fp32 path does)."""
     from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
 
     s, b, nc = residual.shape
     out = fused_h_post_bda(
-        h_res.float(), residual.view(s, b, n, nc // n), h_post.float(), branch_output, None
+        h_res.float(),
+        residual.view(s, b, n, nc // n),
+        h_post.float(),
+        branch_output,
+        None,
+        out_dtype=residual.dtype,
     )
-    return out.to(residual.dtype).view(s, b, nc)
+    return out.view(s, b, nc)
 
 
 class SinglePassHyperConnectionHybridLayer(HyperConnectionHybridLayer):
