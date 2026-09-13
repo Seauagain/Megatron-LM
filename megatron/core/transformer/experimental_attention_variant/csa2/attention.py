@@ -256,18 +256,18 @@ class CSA2Attention(MegatronModule):
     # ---- packed (THD) path, CP >= 1 ------------------------------------------------------------
 
     def _gather_owned_entries(
-        self, local_rows: torch.Tensor, owned_masks: List[torch.Tensor], cp_group
+        self, local_rows: torch.Tensor, comp: thd.CompressedLayout, cp_group
     ) -> torch.Tensor:
         """Assemble the global sequence-major compressed tensor from per-rank owned entries.
 
-        ``local_rows`` are this rank's entries (``[n_owned_local, ...]``); ``owned_masks[r]`` is
-        the global bool mask of the entries rank ``r`` owns (identical on every rank, so the
-        capacity and the destination map are computed without communication). The equal-split
-        all-gather is autograd aware (reduce-scatter in backward).
+        ``local_rows`` are this rank's entries (``[n_owned_local, ...]``); ``comp`` holds the
+        layout-only ownership data (identical on every rank, so the capacity and the
+        destination map are computed without communication, and cached per microbatch). The
+        equal-split all-gather is autograd aware (reduce-scatter in backward).
         """
-        counts = [int(m.sum()) for m in owned_masks]
+        counts = comp.owned_counts()
         capacity = max(counts) if counts else 0
-        total = int(owned_masks[0].numel())
+        total = comp.n_comp
         trailing = tuple(local_rows.shape[1:])
         if capacity == 0:
             return local_rows.new_zeros((total,) + trailing)
@@ -278,10 +278,7 @@ class CSA2Attention(MegatronModule):
         gathered = gather_from_sequence_parallel_region(
             padded, tensor_parallel_output_grad=True, group=cp_group
         )  # [cp * capacity, ...]
-        dest = torch.cat([torch.nonzero(m, as_tuple=False).squeeze(1) for m in owned_masks])
-        src = torch.cat(
-            [torch.arange(n, device=local_rows.device) + r * capacity for r, n in enumerate(counts)]
-        )
+        dest, src = comp.gather_maps()
         out = gathered.new_zeros((total,) + trailing)
         out = out.index_put((dest,), gathered[src])
         return out
@@ -303,7 +300,6 @@ class CSA2Attention(MegatronModule):
         entries are produced by the rank holding the group's last token and all-gathered
         (autograd aware) into the sequence-major global order shared by every consumer layer.
         """
-        cu, seq_lens = thd.packed_layout(packed_seq_params)
         cp_group = self.pg_collection.cp
         cp_size = cp_group.size() if cp_group is not None else 1
         cp_rank = cp_group.rank() if cp_group is not None else 0
@@ -312,14 +308,17 @@ class CSA2Attention(MegatronModule):
 
         total_q, n_heads, head_dim = query.shape
         global_start = cp_rank * total_q
-        # Longest valid segment: sizes the RoPE table for token and compressed positions. One
-        # small host sync per layer; the indexer already syncs cu_comp.
-        max_position = int(seq_lens.max()) if seq_lens.numel() else 0
+        # Layout-only quantities (longest segment, row metadata, compressed lengths, ownership)
+        # are shared by every layer of the microbatch and its recompute replay; the cache
+        # computes each host scalar once instead of once per layer.
+        layout = thd.packed_layout_cached(packed_seq_params, total_q, global_start, cp_rank, cp_size)
+        cu = layout.cu
+        max_position = layout.max_position
         kv_local = key.reshape(total_q, head_dim)
         x_rows = x.reshape(total_q, -1)
         qr_rows = qr.reshape(total_q, -1)
 
-        meta = thd.row_metadata(cu, total_q, global_start, seq_lens)
+        meta = layout.row_metadata()
         halo = 0
         key_buffer = kv_local
         halo_kv = None
@@ -361,16 +360,13 @@ class CSA2Attention(MegatronModule):
 
         state = self._shared_state()
         ratio = self.plan.compress_ratio
-        cu_comp = thd.compressed_cu_seqlens(cu, ratio, seq_lens)
+        comp = layout.comp(ratio)
+        cu_comp = comp.cu_comp
         compressed_base = halo + total_q
 
         if self.plan.runs_compressor:
-            seg_ids, group_ids, first_rows = thd.compressed_entry_metadata(cu, cu_comp, ratio)
-            owned_masks = [
-                thd.owned_compressed_entries(first_rows, ratio, r * total_q, total_q)
-                for r in range(cp_size)
-            ]
-            owned = owned_masks[cp_rank]
+            seg_ids, group_ids, first_rows = comp.entry_metadata()
+            owned = comp.owned_masks()[cp_rank]
             hidden_halo = 0
             hidden_rows = x_rows
             if boundary_hidden is not None:
@@ -380,8 +376,10 @@ class CSA2Attention(MegatronModule):
             group_rows = thd.compressor_group_rows(
                 first_rows[owned], ratio, row_base=global_start - hidden_halo
             )
-            out_of_range = group_rows.numel() and (
-                group_rows.min() < 0 or group_rows.max() >= hidden_rows.size(0)
+            lo, hi = comp.owned_first_rows_range()
+            row_base = global_start - hidden_halo
+            out_of_range = hi >= lo and (
+                lo - row_base < 0 or hi + ratio - 1 - row_base >= hidden_rows.size(0)
             )
             if out_of_range:
                 raise RuntimeError(
@@ -399,14 +397,14 @@ class CSA2Attention(MegatronModule):
                 index_keys_owned = self.indexer.build_index_keys_packed(latent, rope_owned)
                 kv_owned = rope_owned(latent.unsqueeze(1)).squeeze(1)
             if cp_size > 1:
-                kv_global = self._gather_owned_entries(kv_owned, owned_masks, cp_group)
-                keys_global = self._gather_owned_entries(index_keys_owned, owned_masks, cp_group)
+                kv_global = self._gather_owned_entries(kv_owned, comp, cp_group)
+                keys_global = self._gather_owned_entries(index_keys_owned, comp, cp_group)
             else:
                 kv_global, keys_global = kv_owned, index_keys_owned
             record = CompressedKVRecord(
                 source_layer=self.model_layer_id,
                 compress_ratio=ratio,
-                n_compressed=int(cu_comp[-1]),
+                n_compressed=comp.n_comp,
                 kv=kv_global,
                 index_keys=keys_global,
             )
@@ -434,6 +432,7 @@ class CSA2Attention(MegatronModule):
                 cu_comp,
                 rope_rows,
                 candidate_blocks,
+                layout=comp,
             )
             seg_comp_start = cu_comp.to(torch.int64)[meta.segment_ids]
             topk_flat = torch.where(

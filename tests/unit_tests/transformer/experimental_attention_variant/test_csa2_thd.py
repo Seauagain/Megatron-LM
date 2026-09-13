@@ -8,7 +8,9 @@ from megatron.core.transformer.experimental_attention_variant.csa2.reference imp
     sliding_window_indices,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2.thd import (
+    clear_layout_cache,
     compressed_cu_seqlens,
+    packed_layout_cached,
     compressed_entry_metadata,
     compressor_group_rows,
     owned_compressed_entries,
@@ -142,3 +144,78 @@ class TestVisibilityAndIndices:
         local = torch.tensor([[0, 2, -1]], dtype=torch.int32)
         out = shift_compressed_indices(local, segment_comp_start=5, compressed_base=100)
         assert out.tolist() == [[105, 107, -1]]
+
+
+class _Params:
+    def __init__(self, cu_q, cu_pad=None):
+        self.cu_seqlens_q = cu_q
+        self.cu_seqlens_q_padded = cu_pad
+        self.cp_partition_mode = "contiguous"
+
+
+class TestPackedLayoutCache:
+    """The per-microbatch layout cache must reproduce the direct computations exactly and
+    must not serve stale entries."""
+
+    def setup_method(self):
+        clear_layout_cache()
+
+    def test_matches_direct_computation_under_cp(self):
+        cu = torch.tensor([0, 5, 12, 14], dtype=torch.int32)
+        params = _Params(cu)
+        total_q, cp_size, ratio = 7, 2, 2
+        for cp_rank in range(cp_size):
+            layout = packed_layout_cached(params, total_q, cp_rank * total_q, cp_rank, cp_size)
+            assert layout.max_position == 7
+            meta = row_metadata(cu, total_q, cp_rank * total_q)
+            assert torch.equal(layout.row_metadata().positions, meta.positions)
+            comp = layout.comp(ratio)
+            cu_comp = compressed_cu_seqlens(cu, ratio)
+            assert torch.equal(comp.cu_comp, cu_comp)
+            assert comp.cu_comp_list == cu_comp.tolist()
+            assert comp.n_comp == int(cu_comp[-1])
+            assert comp.segments == torch.unique(meta.segment_ids[meta.valid]).tolist()
+            for segment in comp.segments:
+                rows = segment_rows(meta, segment)
+                assert torch.equal(comp.seg_rows(segment), rows)
+                assert comp.seg_first_position(segment) == int(meta.positions[rows[0]])
+            _, _, first_rows = compressed_entry_metadata(cu, cu_comp, ratio)
+            masks = [
+                owned_compressed_entries(first_rows, ratio, r * total_q, total_q)
+                for r in range(cp_size)
+            ]
+            assert comp.owned_counts() == [int(m.sum()) for m in masks]
+            capacity = max(comp.owned_counts())
+            dest, src = comp.gather_maps()
+            assert dest.tolist() == torch.cat([torch.nonzero(m).squeeze(1) for m in masks]).tolist()
+            assert src.tolist() == torch.cat(
+                [torch.arange(n) + r * capacity for r, n in enumerate(comp.owned_counts())]
+            ).tolist()
+            owned_first = first_rows[masks[cp_rank]]
+            expected = (int(owned_first.min()), int(owned_first.max())) if owned_first.numel() else (0, -1)
+            assert comp.owned_first_rows_range() == expected
+
+    def test_hit_same_params_miss_other_layout_and_version(self):
+        cu = torch.tensor([0, 4, 9])
+        params = _Params(cu)
+        a = packed_layout_cached(params, 9, 0, 0, 1)
+        assert packed_layout_cached(params, 9, 0, 0, 1) is a
+        # a different rank view is a different entry
+        assert packed_layout_cached(params, 9, 9, 1, 2) is not a
+        # an in-place edit of cu_seqlens bumps the version counter and misses
+        cu.add_(0)
+        assert packed_layout_cached(params, 9, 0, 0, 1) is not a
+        # a fresh tensor with the same values is another entry (never a stale hit)
+        b = packed_layout_cached(_Params(torch.tensor([0, 4, 9])), 9, 0, 0, 1)
+        assert b is not a
+
+    def test_padded_layout_uses_physical_starts(self):
+        cu_valid = torch.tensor([0, 3, 9])
+        cu_phys = torch.tensor([0, 8, 16])
+        layout = packed_layout_cached(_Params(cu_valid, cu_phys), 16, 0, 0, 1)
+        assert torch.equal(layout.cu, cu_phys)
+        assert layout.seq_lens.tolist() == [3, 6]
+        assert layout.max_position == 6
+        comp = layout.comp(3)
+        assert comp.cu_comp_list == [0, 1, 3]
+        assert comp.segments == [0, 1]

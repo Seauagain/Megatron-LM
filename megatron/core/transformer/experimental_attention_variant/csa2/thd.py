@@ -15,7 +15,8 @@ Under context parallelism the flat axis is split into contiguous blocks; a rank 
 Framework free (plain PyTorch, CPU capable). Independent implementation.
 """
 
-from typing import NamedTuple, Optional, Tuple
+from collections import OrderedDict
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -80,16 +81,20 @@ def compressed_cu_seqlens(
     return torch.cat([cu.new_zeros(1), (lens // ratio).cumsum(0)])
 
 
-def compressed_entry_metadata(cu_seqlens: torch.Tensor, cu_comp: torch.Tensor, ratio: int):
+def compressed_entry_metadata(
+    cu_seqlens: torch.Tensor, cu_comp: torch.Tensor, ratio: int, n_comp: Optional[int] = None
+):
     """For every compressed entry (sequence-major): segment id, group index and the flat row
     of its first token in the packed layout.
 
     Returns ``(segment_ids [n], group_ids [n], first_rows [n])``; group ``j`` of segment ``b``
     stands for RoPE position ``j * ratio`` and covers rows ``cu_seqlens[b] + j*ratio + [0, ratio)``.
+    ``n_comp`` (= ``cu_comp[-1]``) may be passed by a caller that already holds it on the host.
     """
     cu = cu_seqlens.to(torch.int64)
     cu_comp = cu_comp.to(torch.int64)
-    n_comp = int(cu_comp[-1])
+    if n_comp is None:
+        n_comp = int(cu_comp[-1])
     entries = torch.arange(n_comp, device=cu.device, dtype=torch.int64)
     segment_ids = torch.bucketize(entries, cu_comp[1:], right=True).clamp_max(cu.numel() - 2)
     group_ids = entries - cu_comp[segment_ids]
@@ -168,3 +173,209 @@ def shift_compressed_indices(
     """
     shifted = local_indices.to(torch.int64) + segment_comp_start + compressed_base
     return torch.where(local_indices >= 0, shifted, torch.full_like(shifted, -1)).to(torch.int32)
+
+
+# ---- per-microbatch layout cache --------------------------------------------------------------
+#
+# Every CSA2 layer of a microbatch works on the same packed layout, and so does its recompute
+# replay. The handful of host scalars derived from it (longest segment, compressed cumulative
+# lengths, segment lists, owned-entry counts) each cost a device synchronisation when computed
+# per layer: about 120 synchronisations per training step at 40 layers, each one draining the
+# launch queue. The cache below computes them once per microbatch and layout.
+
+
+class CompressedLayout:
+    """Layout-only quantities of one compress ratio; tensors live on the layout's device."""
+
+    def __init__(self, layout: "PackedLayout", ratio: int) -> None:
+        self.ratio = ratio
+        self._layout = layout
+        self.cu_comp = compressed_cu_seqlens(layout.cu, ratio, layout.seq_lens)
+        self.cu_comp_list: List[int] = self.cu_comp.tolist()
+        self.n_comp: int = self.cu_comp_list[-1] if self.cu_comp_list else 0
+        self._segments: Optional[List[int]] = None
+        self._seg_rows: Dict[int, torch.Tensor] = {}
+        self._seg_first_position: Dict[int, int] = {}
+        self._entry_metadata = None
+        self._owned_masks: Optional[List[torch.Tensor]] = None
+        self._owned_counts: Optional[List[int]] = None
+        self._gather_maps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._owned_first_rows_range: Optional[Tuple[int, int]] = None
+
+    @property
+    def segments(self) -> List[int]:
+        """Segment ids that have at least one valid row on this rank (ascending)."""
+        if self._segments is None:
+            meta = self._layout.row_metadata()
+            self._segments = torch.unique(meta.segment_ids[meta.valid]).tolist()
+        return self._segments
+
+    def seg_rows(self, segment: int) -> torch.Tensor:
+        """Local valid rows of ``segment`` (int64, ascending)."""
+        rows = self._seg_rows.get(segment)
+        if rows is None:
+            rows = segment_rows(self._layout.row_metadata(), segment)
+            self._seg_rows[segment] = rows
+        return rows
+
+    def seg_first_position(self, segment: int) -> int:
+        """In-segment position of the first local valid row of ``segment``."""
+        pos = self._seg_first_position.get(segment)
+        if pos is None:
+            rows = self.seg_rows(segment)
+            pos = int(self._layout.row_metadata().positions[rows[0]]) if rows.numel() else 0
+            self._seg_first_position[segment] = pos
+        return pos
+
+    def entry_metadata(self):
+        """``(segment_ids, group_ids, first_rows)`` of every compressed entry."""
+        if self._entry_metadata is None:
+            self._entry_metadata = compressed_entry_metadata(
+                self._layout.cu, self.cu_comp, self.ratio, n_comp=self.n_comp
+            )
+        return self._entry_metadata
+
+    def owned_masks(self) -> List[torch.Tensor]:
+        """Per CP rank: bool mask of the compressed entries that rank produces."""
+        if self._owned_masks is None:
+            _, _, first_rows = self.entry_metadata()
+            total_q, cp_size = self._layout.total_q, self._layout.cp_size
+            self._owned_masks = [
+                owned_compressed_entries(first_rows, self.ratio, r * total_q, total_q)
+                for r in range(cp_size)
+            ]
+        return self._owned_masks
+
+    def owned_counts(self) -> List[int]:
+        if self._owned_counts is None:
+            masks = self.owned_masks()
+            if masks:
+                self._owned_counts = torch.stack([m.sum() for m in masks]).tolist()
+            else:
+                self._owned_counts = []
+        return self._owned_counts
+
+    def gather_maps(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(dest, src)`` index maps that scatter the equal-split all-gather of owned
+        entries (capacity = max owned count per rank) into sequence-major order."""
+        if self._gather_maps is None:
+            counts = self.owned_counts()
+            capacity = max(counts) if counts else 0
+            masks = self.owned_masks()
+            device = self._layout.cu.device
+            dest = torch.cat(
+                [torch.nonzero(m, as_tuple=False).squeeze(1) for m in masks]
+                or [torch.zeros(0, dtype=torch.int64, device=device)]
+            )
+            src = torch.cat(
+                [
+                    torch.arange(n, device=device, dtype=torch.int64) + r * capacity
+                    for r, n in enumerate(counts)
+                ]
+                or [torch.zeros(0, dtype=torch.int64, device=device)]
+            )
+            self._gather_maps = (dest, src)
+        return self._gather_maps
+
+    def owned_first_rows_range(self) -> Tuple[int, int]:
+        """``(min, max)`` global first row of the entries owned by this rank (0, -1 if none)."""
+        if self._owned_first_rows_range is None:
+            _, _, first_rows = self.entry_metadata()
+            owned = first_rows[self.owned_masks()[self._layout.cp_rank]]
+            if owned.numel():
+                lo_hi = torch.stack([owned.min(), owned.max()]).tolist()
+                self._owned_first_rows_range = (int(lo_hi[0]), int(lo_hi[1]))
+            else:
+                self._owned_first_rows_range = (0, -1)
+        return self._owned_first_rows_range
+
+
+class PackedLayout:
+    """One packed microbatch layout as seen by one CP rank, with lazily cached derived data.
+
+    Holding references to the ``cu_seqlens`` tensors keeps their storage alive, so the cache
+    key (their data pointers) cannot be reused by another layout while the entry exists.
+    """
+
+    def __init__(
+        self,
+        cu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        total_q: int,
+        global_start: int,
+        cp_rank: int,
+        cp_size: int,
+    ) -> None:
+        self.cu = cu
+        self.seq_lens = seq_lens
+        self.total_q = total_q
+        self.global_start = global_start
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
+        self._max_position: Optional[int] = None
+        self._meta: Optional[RowMetadata] = None
+        self._comp: Dict[int, CompressedLayout] = {}
+
+    @property
+    def max_position(self) -> int:
+        """Longest valid segment length (sizes the RoPE tables)."""
+        if self._max_position is None:
+            self._max_position = int(self.seq_lens.max()) if self.seq_lens.numel() else 0
+        return self._max_position
+
+    def row_metadata(self) -> RowMetadata:
+        if self._meta is None:
+            self._meta = row_metadata(self.cu, self.total_q, self.global_start, self.seq_lens)
+        return self._meta
+
+    def comp(self, ratio: int) -> CompressedLayout:
+        comp = self._comp.get(ratio)
+        if comp is None:
+            comp = CompressedLayout(self, ratio)
+            self._comp[ratio] = comp
+        return comp
+
+
+_LAYOUT_CACHE: "OrderedDict[tuple, PackedLayout]" = OrderedDict()
+_LAYOUT_CACHE_SIZE = 16
+
+
+def _layout_key(packed_seq_params, total_q: int, global_start: int, cp_rank: int, cp_size: int):
+    cu_q = packed_seq_params.cu_seqlens_q
+    cu_pad = packed_seq_params.cu_seqlens_q_padded
+    return (
+        cu_q.data_ptr(),
+        cu_q._version,
+        cu_q.numel(),
+        0 if cu_pad is None else cu_pad.data_ptr(),
+        0 if cu_pad is None else cu_pad._version,
+        total_q,
+        global_start,
+        cp_rank,
+        cp_size,
+    )
+
+
+def packed_layout_cached(
+    packed_seq_params, total_q: int, global_start: int, cp_rank: int, cp_size: int
+) -> PackedLayout:
+    """Layout of ``packed_seq_params`` for this rank, shared by all layers of the microbatch.
+
+    Keyed by the ``cu_seqlens`` storage pointers and in-place version counters; the entry keeps
+    those tensors alive, so a hit always refers to the same values. Bounded LRU.
+    """
+    key = _layout_key(packed_seq_params, total_q, global_start, cp_rank, cp_size)
+    layout = _LAYOUT_CACHE.get(key)
+    if layout is None:
+        cu, seq_lens = packed_layout(packed_seq_params)
+        layout = PackedLayout(cu, seq_lens, total_q, global_start, cp_rank, cp_size)
+        _LAYOUT_CACHE[key] = layout
+        while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_SIZE:
+            _LAYOUT_CACHE.popitem(last=False)
+    else:
+        _LAYOUT_CACHE.move_to_end(key)
+    return layout
+
+
+def clear_layout_cache() -> None:
+    _LAYOUT_CACHE.clear()

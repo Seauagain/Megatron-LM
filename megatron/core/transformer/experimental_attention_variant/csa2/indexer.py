@@ -32,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2.reference imp
     indexer_topk_indices,
     select_candidate_block_ids,
 )
+from megatron.core.transformer.experimental_attention_variant.csa2 import thd
 from megatron.core.transformer.experimental_attention_variant.csa2.roles import CSA2LayerPlan
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -337,6 +338,7 @@ class CSA2Indexer(MegatronModule):
         cu_comp: torch.Tensor,
         rope_rows_fn,
         candidate_blocks: Optional[torch.Tensor] = None,
+        layout: Optional[thd.CompressedLayout] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Top-k over the compressed entries of each row's own segment (packed layout).
 
@@ -348,6 +350,8 @@ class CSA2Indexer(MegatronModule):
             rope_rows_fn: rotates ``[n, h, d]`` rows at the local rows' positions.
             candidate_blocks: ``[n_q, topk_blocks]`` int32 segment-local block ids per row from
                 the candidate source (``-1`` padded), or None.
+            layout: cached layout scalars of this microbatch and compress ratio (segment list,
+                per-segment rows, host copy of ``cu_comp``); computed here when None.
 
         Returns:
             ``(topk [n_q, k] int32 segment-local ids (-1 invalid), candidate_blocks_or_None)``.
@@ -360,14 +364,29 @@ class CSA2Indexer(MegatronModule):
         head_weights = raw_head_weights.float() * self.head_weight_scale  # fp32, see forward()
         use_fused = getattr(self.config, "csa2_indexer_impl", "reference") == "fused"
 
-        k_width = min(self.topk, int(cu_comp[-1])) if cu_comp.numel() > 1 else 0
+        if layout is None:
+            cu_comp_list = cu_comp.tolist()
+            n_comp_total = cu_comp_list[-1] if len(cu_comp_list) > 1 else 0
+            segments = torch.unique(segment_ids[valid]).tolist()
+            seg_rows_of = lambda segment: torch.nonzero(  # noqa: E731
+                (segment_ids == segment) & valid, as_tuple=False
+            ).squeeze(1)
+            first_position_of = lambda segment, rows: int(positions[rows[0]])  # noqa: E731
+        else:
+            cu_comp_list = layout.cu_comp_list
+            n_comp_total = layout.n_comp if len(cu_comp_list) > 1 else 0
+            segments = layout.segments
+            seg_rows_of = layout.seg_rows
+            first_position_of = lambda segment, rows: layout.seg_first_position(  # noqa: E731
+                segment
+            )
+        k_width = min(self.topk, n_comp_total)
         topk = torch.full((n_q, k_width), -1, dtype=torch.int32, device=hidden_rows.device)
         produced = None
         if self.plan.is_candidate_source:
             produced = torch.full(
                 (n_q, self.candidate_topk_blocks), -1, dtype=torch.int32, device=hidden_rows.device
             )
-        cu_comp_list = cu_comp.tolist()
         max_chunk_rows = max(1, int(getattr(self.config, "csa2_indexer_chunk_rows", 4096)))
         # The selection is integer valued; with frozen indexer weights nothing downstream needs
         # the score graph, so scoring runs without autograd in row chunks. The chunk is bounded
@@ -375,16 +394,19 @@ class CSA2Indexer(MegatronModule):
         # the heads are reduced one at a time so no [rows, heads, n_comp] tensor exists.
         score_ctx = torch.no_grad() if self.frozen else nullcontext()
         with score_ctx:
-            for segment in torch.unique(segment_ids[valid]).tolist():
-                in_segment = (segment_ids == segment) & valid
-                seg_rows = torch.nonzero(in_segment, as_tuple=False).squeeze(1)
+            for segment in segments:
+                seg_rows = seg_rows_of(segment)
                 start, end = cu_comp_list[segment], cu_comp_list[segment + 1]
                 n_comp = end - start
                 if n_comp == 0 or seg_rows.numel() == 0:
                     continue
                 keys_t = None if use_fused else index_keys[start:end].float().t()  # [d, n_comp]
                 chunk_rows = min(max_chunk_rows, _rows_within_budget(n_comp))
-                for c0 in range(0, seg_rows.numel(), chunk_rows):
+                n_seg_rows = seg_rows.numel()
+                # Valid rows of one segment are consecutive packed rows with consecutive
+                # positions, so a chunk's first position follows from the segment's first.
+                seg_pos0 = first_position_of(segment, seg_rows)
+                for c0 in range(0, n_seg_rows, chunk_rows):
                     rows = seg_rows[c0 : c0 + chunk_rows]
                     if (
                         use_fused
@@ -425,18 +447,15 @@ class CSA2Indexer(MegatronModule):
                         continue
                     scores = None
                     if use_fused:
-                        # Rows of one segment chunk are consecutive positions; the kernel
-                        # derives the causal limit from the first position.
-                        pos0, pos1 = int(positions[rows[0]]), int(positions[rows[-1]])
-                        if pos1 - pos0 == rows.numel() - 1:
-                            scores = fused_indexer_scores_rows(
-                                q[rows],
-                                index_keys[start:end],
-                                raw_head_weights[rows],
-                                self.head_weight_scale,
-                                self.plan.compress_ratio,
-                                pos0,
-                            )
+                        # The kernel derives the causal limit from the chunk's first position.
+                        scores = fused_indexer_scores_rows(
+                            q[rows],
+                            index_keys[start:end],
+                            raw_head_weights[rows],
+                            self.head_weight_scale,
+                            self.plan.compress_ratio,
+                            seg_pos0 + c0,
+                        )
                     if scores is None:
                         if keys_t is None:
                             keys_t = index_keys[start:end].float().t()
